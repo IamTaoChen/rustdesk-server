@@ -3,8 +3,8 @@ services:
     # image: rustdesk/rustdesk-server-s6:latest
     build:
       context: .
-      dockerfile: Dockerfile-dev
-    image: rustdesk-server:latest  
+      dockerfile: Dockerfile.dev
+    image: rustdesk-server-s6:latest  
     container_name: ${RUSTDESK_CONTAINER_NAME:-rustdesk}
     hostname: ${RUSTDESK_HOSTNAME:-rustdesk}
     network_mode: host
