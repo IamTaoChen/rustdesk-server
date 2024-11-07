@@ -10,7 +10,7 @@ services:
     network_mode: host
     restart: always
     environment:
-      RELAY: desk2.kyzdt.com:21117
+      RELAY: 127.0.0.1:21117
       KEY: _
       ENCRYPTED_ONLY: 1
       # KEY_PRIV: /run/secrets/key_priv
