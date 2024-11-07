@@ -1,0 +1,26 @@
+services:
+  rustdesk:
+    # image: rustdesk/rustdesk-server-s6:latest
+    build:
+      context: .
+      dockerfile: Dockerfile-dev
+    image: rustdesk-server:latest  
+    container_name: ${RUSTDESK_CONTAINER_NAME:-rustdesk}
+    hostname: ${RUSTDESK_HOSTNAME:-rustdesk}
+    network_mode: host
+    restart: always
+    environment:
+      RELAY: desk2.kyzdt.com:21117
+      KEY: _
+      ENCRYPTED_ONLY: 1
+      # KEY_PRIV: /run/secrets/key_priv
+      # KEY_PUB: /run/secrets/key_pub
+      LIMIT_SPEED: 1024
+      SINGLE_BANDWIDTH: 1024
+    volumes:
+      - /etc/timezone:/etc/timezone:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ${RUSTDESK_BASE_DIR:-.}/data:/data
+    # secrets:
+    #   - key_pub
+    #   - key_priv
