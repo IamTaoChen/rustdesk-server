@@ -1244,10 +1244,15 @@ impl RendezvousServer {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
+                // try to get real ip from X-Forwarded-For header
                 let real_ip = headers
-                    .get("X-Real-IP")
-                    .or_else(|| headers.get("X-Forwarded-For"))
-                    .and_then(|header_value| header_value.to_str().ok());
+                    .get("X-Forwarded-For")
+                    .and_then(|header_value| header_value.to_str().ok())
+                    .and_then(|ip_list| ip_list.split(',').next().map(|ip| ip.trim()))
+                    .or_else(|| {
+                        // try to get real ip from X-Real-IP header
+                        headers.get("X-Real-IP").and_then(|header_value| header_value.to_str().ok())
+                    });
                 if let Some(ip) = real_ip {
                     if ip.contains('.') {
                         addr = format!("{ip}:0").parse().unwrap_or(addr);
@@ -1255,6 +1260,7 @@ impl RendezvousServer {
                         addr = format!("[{ip}]:0").parse().unwrap_or(addr);
                     }
                 }
+                log::debug!("Websocket connection from {:?}", addr);
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
