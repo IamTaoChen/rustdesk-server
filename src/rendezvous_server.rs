@@ -55,12 +55,12 @@ enum Data {
 const REG_TIMEOUT: i32 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
-enum Sink {
+enum SinkType {
     TcpStream(TcpStreamSink),
     Ws(WsSink),
 }
 struct Sink {
-    tx: Sink,
+    tx: SinkType,
     key: Arc<Mutex<Option<Encrypt>>>,
 }
 #[derive(Clone)]
@@ -956,10 +956,10 @@ impl RendezvousServer {
                     bytes = enc.enc(&bytes);
                 }
                 match &mut sink.tx {
-                    Sink::TcpStream(s) => {
+                    SinkType::TcpStream(s) => {
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
-                    Sink::Ws(ws) => {
+                    SinkType::Ws(ws) => {
                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
                     }
                 }
@@ -1289,7 +1289,7 @@ impl RendezvousServer {
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink {
-                tx: Sink::Ws(a),
+                tx: SinkType::Ws(a),
                 key: Arc::new(Mutex::new(None)),
             });
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
@@ -1303,7 +1303,7 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             let enc = Arc::new(Mutex::new(None));
             sink = Some(Sink {
-                tx: Sink::TcpStream(a),
+                tx: SinkType::TcpStream(a),
                 key: enc.clone(),
             });
             // Avoid key exchange if answering on nat helper port
@@ -1510,7 +1510,7 @@ async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket>
 
 #[inline]
 async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
-    let s = listen_any(port as _, true).await?;
+    let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
 }
