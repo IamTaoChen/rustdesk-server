@@ -1,0 +1,16 @@
+# 阶段 2：提取包含 libgcc_s.so.1 的库
+FROM debian:stable-slim AS libgcc_provider
+RUN apt-get update && apt-get install -y libgcc1 && rm -rf /var/lib/apt/lists/*
+
+FROM busybox:stable
+
+COPY --from=libgcc_provider /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/libgcc_s.so.1
+
+COPY target/release/hbbr /usr/bin/hbbr
+COPY target/release/hbbs /usr/bin/hbbs
+
+
+ENV SINGLE_BANDWIDTH=1024 LIMIT_SPEED=1024
+
+
+WORKDIR /root
