@@ -4,3 +4,4 @@ pub mod common;
 mod database;
 mod peer;
 mod version;
+pub mod jwt;
