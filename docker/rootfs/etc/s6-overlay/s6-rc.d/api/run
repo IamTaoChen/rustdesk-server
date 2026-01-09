@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+sleep 3
+cd /app
+./apimain
