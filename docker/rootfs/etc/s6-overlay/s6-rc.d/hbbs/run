@@ -2,5 +2,6 @@
 sleep 2
 cd /data
 PARAMS=
+RMEMS=${RMEMS:-"0"}
 [ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
-/usr/bin/hbbs -r $RELAY $PARAMS
+/usr/bin/hbbs -r $RELAY -M $RMEMS $PARAMS
