@@ -1,0 +1,11 @@
+docker/Dockerfile
+.github
+.vscode
+README.md
+LICENSE
+docker-compose.yml
+
+.gitignore
+
+kubernetes/*
+debian/*
