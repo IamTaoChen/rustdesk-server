@@ -56,7 +56,7 @@ enum Data {
     RelayServers(RelayServers),
 }
 
-const REG_TIMEOUT: i32 = 30_000;
+const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 struct SafeWsSink {
@@ -142,11 +142,22 @@ enum LoopFailure {
     Listener3,
     Listener2,
     Listener,
+    ConsoleListener,
 }
 
 impl RendezvousServer {
+    pub fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+        Self::start_with_bind(None, port, serial, key, rmem)
+    }
+
     #[tokio::main(flavor = "multi_thread")]
-    pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
+    pub async fn start_with_bind(
+        bind_addr: Option<IpAddr>,
+        port: i32,
+        serial: i32,
+        key: &str,
+        rmem: usize,
+    ) -> ResultType<()> {
         let (key, sk) = Self::get_server_sk(key);
         let nat_port = port - 1;
         let ws_port = port + 2;
@@ -156,7 +167,7 @@ impl RendezvousServer {
         log::info!("Listening on tcp/udp :{}", port);
         log::info!("Listening on tcp :{}, extra port for NAT test", nat_port);
         log::info!("Listening on websocket :{}", ws_port);
-        let mut socket = create_udp_listener(port, rmem).await?;
+        let mut socket = create_udp_listener(bind_addr, port, rmem).await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Data>();
         let software_url = get_arg("software-url");
         let version = hbb_common::get_version_from_url(&software_url);
@@ -199,15 +210,18 @@ impl RendezvousServer {
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
         rs.parse_relay_servers(&get_arg("relay-servers"));
-        let mut listener = create_tcp_listener(port).await?;
-        let mut listener2 = create_tcp_listener(nat_port).await?;
-        let mut listener3 = create_tcp_listener(ws_port).await?;
-        let test_addr = std::env::var("TEST_HBBS").unwrap_or_default();
-        if std::env::var("ALWAYS_USE_RELAY")
-            .unwrap_or_default()
-            .to_uppercase()
-            == "Y"
-        {
+        let mut listener = create_tcp_listener(bind_addr, port).await?;
+        let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
+        let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
+        let mut listener_console = listen_console(bind_addr, nat_port as _).await?;
+        log::info!("Listening on tcp/udp {}", listener.local_addr()?);
+        log::info!(
+            "Listening on tcp {}, extra port for NAT test",
+            listener2.local_addr()?
+        );
+        log::info!("Listening on websocket {}", listener3.local_addr()?);
+        let test_addr = get_arg("TEST_HBBS");
+        if get_arg("ALWAYS_USE_RELAY").to_uppercase() == "Y" {
             ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
         }
         log::info!(
@@ -270,6 +284,7 @@ impl RendezvousServer {
                         &mut listener,
                         &mut listener2,
                         &mut listener3,
+                        &mut listener_console,
                         &mut socket,
                         &key,
                     )
@@ -277,19 +292,23 @@ impl RendezvousServer {
                 {
                     LoopFailure::UdpSocket => {
                         drop(socket);
-                        socket = create_udp_listener(port, rmem).await?;
+                        socket = create_udp_listener(bind_addr, port, rmem).await?;
                     }
                     LoopFailure::Listener => {
                         drop(listener);
-                        listener = create_tcp_listener(port).await?;
+                        listener = create_tcp_listener(bind_addr, port).await?;
                     }
                     LoopFailure::Listener2 => {
                         drop(listener2);
-                        listener2 = create_tcp_listener(nat_port).await?;
+                        listener2 = create_tcp_listener(bind_addr, nat_port).await?;
+                    }
+                    LoopFailure::ConsoleListener => {
+                        drop(listener_console.take());
+                        listener_console = listen_console(bind_addr, nat_port as _).await?;
                     }
                     LoopFailure::Listener3 => {
                         drop(listener3);
-                        listener3 = create_tcp_listener(ws_port).await?;
+                        listener3 = create_tcp_listener(bind_addr, ws_port).await?;
                     }
                 }
             }
@@ -307,6 +326,7 @@ impl RendezvousServer {
         listener: &mut TcpListener,
         listener2: &mut TcpListener,
         listener3: &mut TcpListener,
+        listener_console: &mut Option<TcpListener>,
         socket: &mut FramedSocket,
         key: &str,
     ) -> LoopFailure {
@@ -355,6 +375,18 @@ impl RendezvousServer {
                         Err(err) => {
                            log::error!("listener2.accept failed: {}", err);
                            return LoopFailure::Listener2;
+                        }
+                    }
+                }
+                res = accept_or_pending(listener_console.as_ref()) => {
+                    match res {
+                        Ok((stream, addr))  => {
+                            stream.set_nodelay(true).ok();
+                            self.handle_listener2(stream, addr).await;
+                        }
+                        Err(err) => {
+                           log::error!("console listener.accept failed: {}", err);
+                           return LoopFailure::ConsoleListener;
                         }
                     }
                 }
@@ -440,22 +472,14 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    if self.pm.is_in_memory(&ph.id).await {
-                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
-                    } else {
-                        // not in memory, fetch from db with spawn in case blocking me
-                        let mut me = self.clone();
-                        let key = key.to_owned();
-                        tokio::spawn(async move {
-                            allow_err!(me.handle_udp_punch_hole_request(addr, ph, &key).await);
-                        });
-                    }
+                    // UDP PunchHoleRequest is intentionally unsupported.
+                    // The supported client path sends PunchHoleRequest over TCP/WS.
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    self.handle_hole_sent(phs, addr, Some(socket)).await?;
+                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    self.handle_local_addr(la, addr, Some(socket)).await?;
+                    // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -673,7 +697,7 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i32;
+                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
@@ -938,7 +962,7 @@ impl RendezvousServer {
         if let Some(peer) = self.pm.get(&id).await {
             let (elapsed, peer_addr) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i32, r.socket_addr)
+                (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -1392,6 +1416,15 @@ impl RendezvousServer {
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
             let callback = |req: &Request, response: Response| {
                 let headers = req.headers();
+                // X-Real-IP / X-Forwarded-For are trusted as-is so that the real
+                // client IP is preserved when the WebSocket port runs behind a
+                // reverse proxy (WSS). They are NOT validated: anyone who can reach
+                // this port directly can spoof an arbitrary IP, bypassing IP-based
+                // rate limiting / blocking and corrupting logged IPs. Do not expose
+                // the WebSocket port directly to untrusted networks; only the
+                // reverse proxy, which overwrites these headers, should be able to
+                // connect to it.
+                // https://github.com/rustdesk/rustdesk-server/issues/634
                 let real_ip = headers
                     .get("X-Real-IP")
                     .or_else(|| headers.get("X-Forwarded-For"))
@@ -1626,7 +1659,15 @@ async fn send_rk_res(
     socket.send(&msg_out, addr).await
 }
 
-async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket> {
+async fn create_udp_listener(
+    bind_addr: Option<IpAddr>,
+    port: i32,
+    rmem: usize,
+) -> ResultType<FramedSocket> {
+    if let Some(bind_addr) = bind_addr {
+        let addr = SocketAddr::new(bind_addr, port as _);
+        return FramedSocket::new_reuse(&addr, true, rmem).await;
+    }
     let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port as _);
     if let Ok(s) = FramedSocket::new_reuse(&addr, true, rmem).await {
         log::debug!("listen on udp {:?}", s.local_addr());
@@ -1639,8 +1680,8 @@ async fn create_udp_listener(port: i32, rmem: usize) -> ResultType<FramedSocket>
 }
 
 #[inline]
-async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
-    let s = listen_any(port as _).await?;
+async fn create_tcp_listener(bind_addr: Option<IpAddr>, port: i32) -> ResultType<TcpListener> {
+    let s = listen_tcp(bind_addr, port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
 }
@@ -1661,5 +1702,17 @@ fn get_symetric_key_from_msg(
             key_array
         }
         Err(e) => panic!("Error while opening the seal key{:?}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[hbb_common::tokio::test]
+    async fn udp_listener_uses_bind_address() {
+        let bind_addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let socket = create_udp_listener(Some(bind_addr), 0, 0).await.unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), bind_addr);
     }
 }
