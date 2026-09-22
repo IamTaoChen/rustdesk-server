@@ -1092,6 +1092,7 @@ impl RendezvousServer {
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
         let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
+        self.ws_map.lock().await.remove(&try_into_v4(addr));
         tokio::spawn(async move {
             Self::send_to_sink(&mut tcp, msg).await;
         });
