@@ -29,7 +29,7 @@ use hbb_common::{
         self,
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
-        sync::{mpsc, Mutex},
+        sync::{mpsc, Mutex, RwLock},
         time::{interval, Duration},
     },
     tokio_util::codec::Framed,
@@ -127,14 +127,14 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, Arc<Mutex<Sink>>>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
-    ws_map: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink, String)>>>>>,
 }
 
 enum LoopFailure {
@@ -204,7 +204,7 @@ impl RendezvousServer {
                 secure_tcp_pk_b,
                 secure_tcp_sk_b,
             }),
-            ws_map: Arc::new(Mutex::new(HashMap::new())),
+            conn_map: Arc::new(RwLock::new(HashMap::new())),
         };
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
@@ -275,6 +275,10 @@ impl RendezvousServer {
                 }
             });
         };
+        let conn_map = rs.conn_map.clone();
+        tokio::spawn(async move {
+            heartbeat_loop(conn_map).await;
+        });
         let main_task = async move {
             loop {
                 log::info!("Start");
@@ -581,7 +585,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), Arc::new(Mutex::new(sink)));
                     }
                     allow_err!(self.handle_tcp_punch_hole_request(addr, ph, key, ws).await);
                     return true;
@@ -589,7 +596,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                        self.tcp_punch
+                            .lock()
+                            .await
+                            .insert(try_into_v4(addr), Arc::new(Mutex::new(sink)));
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -642,7 +652,7 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    let response = self.handle_register_pk(rk, addr, ws).await;
+                    let response = self.handle_register_pk(rk.clone(), addr, ws).await;
                     match response {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
@@ -660,11 +670,11 @@ impl RendezvousServer {
                                 ..Default::default()
                             });
                             Self::send_to_sink(sink, msg_out).await;
-                            if ws {
-                                // for ws, we can only get addr when register_pk
-                                if let Some(sink) = sink.take() {
-                                    self.ws_map.lock().await.insert(try_into_v4(addr), sink);
-                                }
+                            if let Some(sink) = sink.take() {
+                                self.conn_map.write().await.insert(
+                                    try_into_v4(addr),
+                                    Arc::new(Mutex::new((sink, rk.id))),
+                                );
                             }
                             return true;
                         }
@@ -713,7 +723,25 @@ impl RendezvousServer {
                     });
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                _ => {}
+                Some(rendezvous_message::Union::IceCandidate(ice)) => {
+                    allow_err!(self.handle_ice_candidate(ice, addr).await);
+                    // the connection is the ICE bridge route, keep it open for the trickle
+                    return true;
+                }
+                _ => {
+                    if bytes.is_empty() {
+                        let addr_v4 = try_into_v4(addr);
+                        if let Some(sink) = self.conn_map.read().await.get(&addr_v4) {
+                            let peer_id = sink.lock().await.1.clone();
+                            if !peer_id.is_empty() {
+                                if let Some(peer) = self.pm.get_in_memory(&peer_id).await {
+                                    peer.write().await.last_reg_time = Instant::now();
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         false
@@ -893,6 +921,7 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
+            webrtc_sdp_answer: phs.webrtc_sdp_answer,
             // B arrived via UDP => `addr` is B's UDP mapping; A must switch to its UDP socket.
             is_udp: socket.is_some(),
             // A's IPv6 leg is gated on this dedicated field: carry B's own public v6
@@ -1120,6 +1149,8 @@ impl RendezvousServer {
                     socket_addr_v6,
                     nat_type: ph.nat_type,
                     relay_server,
+                    force_relay: ph.force_relay,
+                    webrtc_sdp_offer: ph.webrtc_sdp_offer,
                     // forward A's observed UDP port so B can probe it and take the UDP punch path
                     udp_port: ph.udp_port,
                     ..Default::default()
@@ -1157,11 +1188,22 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, msg: RendezvousMessage, addr: SocketAddr) {
-        let mut tcp = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        self.ws_map.lock().await.remove(&try_into_v4(addr));
-        tokio::spawn(async move {
-            Self::send_to_sink(&mut tcp, msg).await;
-        });
+        let addr_v4 = try_into_v4(addr);
+        let sink_arc = self.conn_map.read().await.get(&addr_v4).cloned();
+        if let Some(sink_arc) = sink_arc {
+            let mut sink = sink_arc.lock().await;
+            sink.0.send(&msg).await;
+            return;
+        }
+
+        // the sink stays for later punch attempts on the same socket and the ICE bridge echo
+        let tcp = self.tcp_punch.lock().await.get(&try_into_v4(addr)).cloned();
+        if let Some(tcp) = tcp {
+            tokio::spawn(async move {
+                let mut tcp = tcp.lock().await;
+                tcp.send(&msg).await;
+            });
+        }
     }
 
     #[inline]
@@ -1177,8 +1219,62 @@ impl RendezvousServer {
         msg: RendezvousMessage,
         addr: SocketAddr,
     ) -> ResultType<()> {
-        let mut sink = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        Self::send_to_sink(&mut sink, msg).await;
+        let addr_v4 = try_into_v4(addr);
+        if let Some(sink) = self.conn_map.read().await.get(&addr_v4).cloned() {
+            sink.lock().await.0.send(&msg).await;
+            return Ok(());
+        }
+        let tcp = self.tcp_punch.lock().await.get(&addr_v4).cloned();
+        if let Some(tcp) = tcp {
+            let mut tcp = tcp.lock().await;
+            tcp.send(&msg).await;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn handle_ice_candidate(
+        &mut self,
+        ice: IceCandidate,
+        addr: SocketAddr,
+    ) -> ResultType<()> {
+        // the controlled side echoes the controller's punch/relay socket address back,
+        // while the controller only carries the controlled side's id
+        let target = if !ice.socket_addr.is_empty() {
+            Some(AddrMangle::decode(&ice.socket_addr))
+        } else if !ice.id.is_empty() {
+            match self.pm.get_in_memory(&ice.id).await {
+                Some(peer) => {
+                    let peer = peer.read().await;
+                    Some(peer.socket_addr)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            log::debug!(
+                "IceCandidate from {:?} dropped, no route (id: {:?})",
+                addr,
+                ice.id
+            );
+            return Ok(());
+        };
+        let target = try_into_v4(target);
+        let mut msg_out = RendezvousMessage::new();
+        msg_out.set_ice_candidate(ice);
+        if let Some(sink_arc) = self.conn_map.read().await.get(&target).cloned() {
+            let mut sink = sink_arc.lock().await;
+            sink.0.send(&msg_out).await;
+            return Ok(());
+        }
+        if let Some(tcp) = self.tcp_punch.lock().await.get(&target).cloned() {
+            let mut tcp = tcp.lock().await;
+            tcp.send(&msg_out).await;
+            return Ok(());
+        }
+        self.tx.send(Data::Msg(msg_out.into(), target)).ok();
         Ok(())
     }
 
@@ -1192,9 +1288,9 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            let mut sink = self.ws_map.lock().await.remove(&try_into_v4(addr));
-            if let Some(s) = sink.as_mut() {
-                s.send(&msg).await;
+            let sink = self.conn_map.read().await.get(&try_into_v4(addr)).cloned();
+            if let Some(sink) = sink {
+                sink.lock().await.0.send(&msg).await;
             } else {
                 self.tx.send(Data::Msg(msg.into(), addr))?;
             }
@@ -1552,14 +1648,22 @@ impl RendezvousServer {
             if !key.is_empty() {
                 self.key_exchange_phase1(addr, &mut sink).await;
             }
+            // The sink also holds the decrypt key, but PunchHoleRequest / RequestRelay move it into
+            // tcp_punch for address-based response routing. Keep an independent key copy so this loop
+            // can still decrypt the controller's later encrypted ICE candidates; otherwise they fail
+            // to parse, handle_tcp returns false, and the connection (and remaining candidates) dies.
+            let mut dec: Option<Encrypt> = None;
             while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
                 // log::debug!("receive tcp data from {:?} {:?}", addr, bytes);
-                if let Some(Sink::Tss(s)) = sink.as_mut() {
-                    if let Some(key) = s.encrypt.as_mut() {
-                        if let Err(err) = key.dec(&mut bytes) {
-                            log::error!("dec tcp data from {:?} err: {:?}", addr, err);
-                            break;
-                        }
+                if dec.is_none() {
+                    if let Some(Sink::Tss(s)) = sink.as_mut() {
+                        dec = s.encrypt.clone();
+                    }
+                }
+                if let Some(key) = dec.as_mut() {
+                    if let Err(err) = key.dec(&mut bytes) {
+                        log::error!("dec tcp data from {:?} err: {:?}", addr, err);
+                        break;
                     }
                 }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
@@ -1570,6 +1674,7 @@ impl RendezvousServer {
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
+        self.conn_map.write().await.remove(&try_into_v4(addr));
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
     }
@@ -1667,6 +1772,31 @@ impl RendezvousServer {
                 Self::send_to_sink(sink, msg_out).await;
             }
             None => {}
+        }
+    }
+}
+
+async fn heartbeat_loop(conn_map: Arc<RwLock<HashMap<SocketAddr, Arc<Mutex<(Sink, String)>>>>>) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(REG_TIMEOUT as u64 / 2)).await;
+
+        let sinks = {
+            let map = conn_map.read().await;
+            map.values().cloned().collect::<Vec<_>>()
+        };
+
+        for chunk in sinks.chunks(200) {
+            for sink in chunk {
+                let sink = sink.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut sink) = sink.try_lock() {
+                        let _ = timeout(REG_TIMEOUT as u64, async {
+                            sink.0.send(&RendezvousMessage::new()).await
+                        }).await;
+                    }
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
