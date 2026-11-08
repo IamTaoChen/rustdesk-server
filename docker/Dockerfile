@@ -7,7 +7,8 @@ ENV CARGO_TERM_COLOR=always
 RUN cargo build --release
 
 # ---------- rustdesk-api ----------
-FROM lejianwen/rustdesk-api:latest AS api
+FROM kyzdt/rustdesk-server:latest AS api
+# FROM lejianwen/rustdesk-api:dev AS api
 
 # ---------- s6 downloader ----------
 FROM debian:trixie-slim AS s6-downloader
