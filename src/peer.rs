@@ -104,7 +104,7 @@ impl PeerMap {
         pk: Bytes,
         ip: String,
     ) -> register_pk_response::Result {
-        log::info!("update_pk {} {:?} {:?} {:?}", id, addr, uuid, pk);
+        log::info!("update_pk {} {}", id, addr);
         let (info_str, guid) = {
             let mut w = peer.write().await;
             w.socket_addr = addr;

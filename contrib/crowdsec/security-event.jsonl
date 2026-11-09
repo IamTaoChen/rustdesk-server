@@ -1,0 +1,1 @@
+{"schema_version":1,"timestamp":"2026-11-09T08:00:00.000Z","service":"hbbs","event":"authentication_failed","source_ip":"192.0.2.10","source_port":45678,"transport":"tcp","outcome":"invalid_key"}

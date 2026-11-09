@@ -1,0 +1,15 @@
+name: local/security-json
+description: Map standard JSON security events to CrowdSec metadata
+filter: "evt.Line.Labels.type == 'security-json' && JsonExtract(evt.Line.Raw, 'schema_version') == '1' && JsonExtract(evt.Line.Raw, 'source_ip') != ''"
+onsuccess: next_stage
+statics:
+  - meta: source_ip
+    expression: "JsonExtract(evt.Line.Raw, 'source_ip')"
+  - meta: service
+    expression: "JsonExtract(evt.Line.Raw, 'service')"
+  - meta: log_type
+    expression: "JsonExtract(evt.Line.Raw, 'event')"
+  - meta: outcome
+    expression: "JsonExtract(evt.Line.Raw, 'outcome')"
+  - target: evt.StrTime
+    expression: "JsonExtract(evt.Line.Raw, 'timestamp')"

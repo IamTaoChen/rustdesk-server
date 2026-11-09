@@ -6,3 +6,4 @@ mod peer;
 mod version;
 pub mod signaling;
 mod udp_punch;
+pub mod security_log;

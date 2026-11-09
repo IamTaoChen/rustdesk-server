@@ -1,5 +1,6 @@
 use async_speed_limit::Limiter;
 use async_trait::async_trait;
+use hbbs::security_log::{self, Event};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -491,6 +492,7 @@ async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limit
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
+                    security_log::record("hbbr", Event::AuthenticationFailed, addr, if stream.is_ws() { "ws" } else { "tcp" }, "invalid_key", None);
                     log::warn!("Relay authentication failed from {} - invalid key", addr);
                     return;
                 }

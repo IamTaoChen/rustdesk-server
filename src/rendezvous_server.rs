@@ -2,6 +2,7 @@ use crate::common::*;
 use crate::peer::*;
 use crate::signaling::ServerHandshake;
 use crate::udp_punch::{self, Pending, Routes};
+use crate::security_log::{self, Event};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -463,7 +464,9 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     if rk.uuid.is_empty() || rk.pk.is_empty() { return Ok(()); }
+                    let id = rk.id.clone();
                     let result = self.handle_register_pk(rk, addr, false).await;
+                    security_log::registration(result, addr, "udp", &id, false);
                     send_rk_res(socket, addr, result).await?;
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
@@ -641,6 +644,7 @@ impl RendezvousServer {
                     let id = rk.id.clone();
                     let rename = !rk.old_id.is_empty();
                     let result = self.handle_register_pk(rk, addr, true).await;
+                    security_log::registration(result, addr, if ws { "ws" } else { "tcp" }, &id, rename);
                     let mut message = RendezvousMessage::new();
                     message.set_register_pk_response(RegisterPkResponse {
                         result: result.into(), keep_alive: 30, ..Default::default()
@@ -713,24 +717,12 @@ impl RendezvousServer {
             } else {
                 if peer.uuid == rk.uuid {
                     if peer.info.ip != ip && peer.pk != rk.pk {
-                        log::warn!(
-                            "Peer {} ip/pk mismatch: {}/{:?} vs {}/{:?}",
-                            id,
-                            ip,
-                            rk.pk,
-                            peer.info.ip,
-                            peer.pk,
-                        );
+                        log::warn!("Peer {} IP/key mismatch from {}", id, ip);
                         drop(peer);
                         return UUID_MISMATCH;
                     }
                 } else {
-                    log::warn!(
-                        "Peer {} uuid mismatch: {:?} vs {:?}",
-                        id,
-                        rk.uuid,
-                        peer.uuid
-                    );
+                    log::warn!("Peer {} UUID mismatch from {}", id, ip);
                     drop(peer);
                     return UUID_MISMATCH;
                 }
@@ -973,6 +965,7 @@ impl RendezvousServer {
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
+            security_log::record("hbbs", Event::AuthenticationFailed, addr, if ws { "ws" } else { "tcp" }, "invalid_key", Some(&ph.id));
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1567,14 +1560,26 @@ impl RendezvousServer {
                 };
                 let Some(Ok(mut bytes)) = bytes else { break; };
                 last_recv = Instant::now();
-                if let Some(cipher) = decrypt.as_mut() { cipher.dec(&mut bytes)?; }
+                if let Some(cipher) = decrypt.as_mut() {
+                    if let Err(error) = cipher.dec(&mut bytes) {
+                        security_log::record("hbbs", Event::HandshakeRejected, addr, "tcp", "invalid_ciphertext", None);
+                        return Err(error.into());
+                    }
+                }
                 if bytes.is_empty() { self.refresh_registration(addr).await; continue; }
                 if let Ok(message) = RendezvousMessage::parse_from_bytes(&bytes) {
                     if let Some(rendezvous_message::Union::KeyExchange(reply)) = message.union {
-                        let state = handshake.take().ok_or_else(|| {
-                            hbb_common::anyhow::anyhow!("Unexpected key exchange")
-                        })?;
-                        let cipher = state.finish(&reply)?;
+                        let Some(state) = handshake.take() else {
+                            security_log::record("hbbs", Event::HandshakeRejected, addr, "tcp", "unexpected_exchange", None);
+                            bail!("Unexpected key exchange");
+                        };
+                        let cipher = match state.finish(&reply) {
+                            Ok(cipher) => cipher,
+                            Err(error) => {
+                                security_log::record("hbbs", Event::HandshakeRejected, addr, "tcp", "invalid_exchange", None);
+                                return Err(error);
+                            }
+                        };
                         decrypt = Some(cipher.clone());
                         if let Some(Sink::TcpStream(_, encrypt)) = sink.as_mut() {
                             *encrypt = Some(cipher);

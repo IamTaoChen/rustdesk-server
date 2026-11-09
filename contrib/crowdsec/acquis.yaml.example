@@ -1,0 +1,4 @@
+filenames:
+  - /var/log/rustdesk/security.jsonl
+labels:
+  type: security-json
