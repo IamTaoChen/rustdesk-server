@@ -639,12 +639,14 @@ impl RendezvousServer {
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     let id = rk.id.clone();
+                    let rename = !rk.old_id.is_empty();
                     let result = self.handle_register_pk(rk, addr, true).await;
                     let mut message = RendezvousMessage::new();
                     message.set_register_pk_response(RegisterPkResponse {
                         result: result.into(), keep_alive: 30, ..Default::default()
                     });
                     Self::send_to_sink(sink, message).await;
+                    if rename { return false; }
                     if result != register_pk_response::Result::OK { return false; }
                     if let Some(sink) = sink.take() {
                         self.connections.lock().await.insert(try_into_v4(addr), RegisteredSession {
@@ -676,6 +678,23 @@ impl RendezvousServer {
     async fn handle_register_pk(
         &mut self, rk: RegisterPk, addr: SocketAddr, persistent: bool,
     ) -> register_pk_response::Result {
+        let identity_lock = self.pm.identity_lock.clone();
+        let _identity = identity_lock.lock().await;
+        if !rk.old_id.is_empty() {
+            if !persistent { return register_pk_response::Result::NOT_SUPPORT; }
+            if rk.uuid.is_empty() || rk.uuid.len() > 1024 || rk.old_id.len() > MAX_PEER_ID_LEN
+                || !hbb_common::is_valid_custom_id(&rk.id) {
+                return register_pk_response::Result::INVALID_ID_FORMAT;
+            }
+            if !self.check_ip_blocker(&addr.ip().to_string(), &rk.id).await { return TOO_FREQUENT; }
+            let result = self.pm.rename(&rk.old_id, &rk.id, &rk.uuid).await;
+            if result == register_pk_response::Result::OK {
+                for session in self.connections.lock().await.values_mut() {
+                    if session.id == rk.old_id { session.id = rk.id.clone(); }
+                }
+            }
+            return result;
+        }
         if rk.uuid.is_empty() || rk.uuid.len() > 1024 || rk.pk.len() != 32 {
             return register_pk_response::Result::INVALID_ID_FORMAT;
         }

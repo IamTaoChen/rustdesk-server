@@ -19,3 +19,9 @@ ICE replies must target a live punch route and come from the expected peer IP. I
 Both extensions are off by default. Set `ENABLE_UDP_PUNCH=Y` to enable observed-port NAT replies and UDP punch replies. An initial TCP punch request must establish the route and declare the controller's UDP port. Replies must match the expected peer IP and device ID, expire after 30 seconds, and consume the route. The table holds at most 4096 routes; correlated UDP retries are limited to two. Closing the TCP connection removes its pending route. Unsolicited UDP punch requests are ignored. NAT replies contain only the observed port and have a global budget of 200 packets per second.
 
 Set `ENABLE_IPV6_PUNCH=Y` to forward IPv6 address metadata. Only encoded IPv6 unicast addresses with a nonzero port are accepted; unspecified, multicast and link-local addresses are omitted. This does not create an IPv6 relay or verify a client's claimed IPv6 address. TCP/relay fallback remains available.
+
+## Changing a device ID
+
+The official client's TCP `RegisterPk` request with `old_id` can rename an existing device. The new ID follows the shared client's custom-ID rule (starts with an ASCII letter, followed by 5–15 word characters or hyphens). A matching nonempty UUID is required. The database changes only the ID in one conditional statement, preserving GUID, public key and metadata; live session/cache entries move to the new ID. Occupied IDs return `ID_EXISTS`, wrong owners return `UUID_MISMATCH`, and failed requests do not allocate a new peer.
+
+The legacy official client sends this request without negotiated encryption. UUID ownership is the protocol's credential for this operation, not a user login. Protect the transport/network when using legacy clients. API inventory and address-book names are managed separately and are not renamed by this operation.

@@ -66,6 +66,7 @@ pub(crate) type LockPeer = Arc<RwLock<Peer>>;
 pub(crate) struct PeerMap {
     map: Arc<RwLock<HashMap<String, LockPeer>>>,
     pub(crate) db: database::Database,
+    pub(crate) identity_lock: Arc<Mutex<()>>,
 }
 
 impl PeerMap {
@@ -88,6 +89,7 @@ impl PeerMap {
         let pm = Self {
             map: Default::default(),
             db: database::Database::new(&db).await?,
+            identity_lock: Default::default(),
         };
         Ok(pm)
     }
@@ -137,7 +139,9 @@ impl PeerMap {
 
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
-        let p = self.map.read().await.get(id).cloned();
+        // Keep DB hydration and cache insertion together so a rename cannot resurrect an old ID.
+        let mut map = self.map.write().await;
+        let p = map.get(id).cloned();
         if p.is_some() {
             return p;
         } else if let Ok(Some(v)) = self.db.get_peer(id).await {
@@ -151,10 +155,27 @@ impl PeerMap {
                 ..Default::default()
             };
             let peer = Arc::new(RwLock::new(peer));
-            self.map.write().await.insert(id.to_owned(), peer.clone());
+            map.insert(id.to_owned(), peer.clone());
             return Some(peer);
         }
         None
+    }
+
+    /// Caller holds identity_lock, shared with normal registrations.
+    pub(crate) async fn rename(&self, old: &str, new: &str, uuid: &[u8]) -> register_pk_response::Result {
+        use register_pk_response::Result::*;
+        let peer = match self.get(old).await { Some(peer) => peer, None => return UUID_MISMATCH };
+        if peer.read().await.uuid.as_ref() != uuid { return UUID_MISMATCH; }
+        let mut map = self.map.write().await;
+        match self.db.rename_peer(old, new, uuid).await {
+            Ok(true) => {
+                map.remove(old);
+                map.insert(new.to_owned(), peer);
+                OK
+            }
+            Ok(false) => ID_EXISTS,
+            Err(err) => { log::error!("db.rename_peer failed: {}", err); SERVER_ERROR }
+        }
     }
 
     #[inline]
