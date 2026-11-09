@@ -13,3 +13,9 @@ WebRTC signaling requires the controlled peer to register over encrypted TCP or 
 WebSocket application encryption is skipped by the official client. Terminate TLS at a trusted reverse proxy and restrict access to the backend WebSocket port. The inherited upstream handling trusts forwarded-IP headers; only the proxy should be able to set them.
 
 ICE replies must target a live punch route and come from the expected peer IP. ICE is not forwarded to arbitrary UDP addresses. Permissions and audit-context fields supplied by a controller are cleared: centralized permissions are outside this patch set, and clients must not assign themselves permissions.
+
+## Experimental UDP and IPv6
+
+Both extensions are off by default. Set `ENABLE_UDP_PUNCH=Y` to enable observed-port NAT replies and UDP punch replies. An initial TCP punch request must establish the route and declare the controller's UDP port. Replies must match the expected peer IP and device ID, expire after 30 seconds, and consume the route. The table holds at most 4096 routes; correlated UDP retries are limited to two. Closing the TCP connection removes its pending route. Unsolicited UDP punch requests are ignored. NAT replies contain only the observed port and have a global budget of 200 packets per second.
+
+Set `ENABLE_IPV6_PUNCH=Y` to forward IPv6 address metadata. Only encoded IPv6 unicast addresses with a nonzero port are accepted; unspecified, multicast and link-local addresses are omitted. This does not create an IPv6 relay or verify a client's claimed IPv6 address. TCP/relay fallback remains available.

@@ -1,6 +1,7 @@
 use crate::common::*;
 use crate::peer::*;
 use crate::signaling::ServerHandshake;
+use crate::udp_punch::{self, Pending, Routes};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -167,6 +168,8 @@ pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, SharedSink>>>,
     connections: Arc<Mutex<HashMap<SocketAddr, RegisteredSession>>>,
     punch_targets: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
+    udp_routes: Arc<Mutex<Routes>>,
+    udp_nat_budget: Arc<Mutex<(Instant, u16)>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -224,6 +227,8 @@ impl RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             connections: Default::default(),
             punch_targets: Default::default(),
+            udp_routes: Default::default(),
+            udp_nat_budget: Arc::new(Mutex::new((Instant::now(), 0))),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -462,14 +467,32 @@ impl RendezvousServer {
                     send_rk_res(socket, addr, result).await?;
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
-                    // UDP PunchHoleRequest is intentionally unsupported.
-                    // The supported client path sends PunchHoleRequest over TCP/WS.
+                    if udp_punch::enabled("ENABLE_UDP_PUNCH") {
+                        self.handle_udp_punch_hole_request(addr, ph, key).await?;
+                    }
                 }
                 Some(rendezvous_message::Union::PunchHoleSent(phs)) => {
-                    // UDP PunchHoleSent is intentionally unsupported to avoid UDP reflection/amplification
+                    if udp_punch::enabled("ENABLE_UDP_PUNCH") {
+                        self.handle_hole_sent(phs, addr, Some(socket)).await?;
+                    }
                 }
                 Some(rendezvous_message::Union::LocalAddr(la)) => {
-                    // UDP LocalAddr is intentionally unsupported to avoid UDP reflection/amplification
+                    if udp_punch::enabled("ENABLE_UDP_PUNCH") {
+                        self.handle_local_addr(la, addr, Some(socket)).await?;
+                    }
+                }
+                Some(rendezvous_message::Union::TestNatRequest(_)) => {
+                    if udp_punch::enabled("ENABLE_UDP_PUNCH") {
+                        // A small response with a global packet budget, never a configuration dump.
+                        let mut budget = self.udp_nat_budget.lock().await;
+                        if budget.0.elapsed() >= Duration::from_secs(1) { *budget = (Instant::now(), 0); }
+                        if budget.1 >= 200 { return Ok(()); }
+                        budget.1 += 1;
+                        drop(budget);
+                        let mut reply = RendezvousMessage::new();
+                        reply.set_test_nat_response(TestNatResponse { port: addr.port() as i32, ..Default::default() });
+                        socket.send(&reply, addr).await?;
+                    }
                 }
                 Some(rendezvous_message::Union::ConfigureUpdate(mut cu)) => {
                     if try_into_v4(addr).ip().is_loopback() && cu.serial > self.inner.serial {
@@ -766,6 +789,7 @@ impl RendezvousServer {
         let addr = try_into_v4(addr);
         self.tcp_punch.lock().await.remove(&addr);
         self.punch_targets.lock().await.remove(&addr);
+        self.udp_routes.lock().await.0.remove(&addr);
         let session = self.connections.lock().await.remove(&addr);
         if let Some(session) = session {
             if let Some(peer) = self.pm.get_in_memory(&session.id).await {
@@ -844,6 +868,12 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // punch hole sent from B, tell A that B is ready to be connected
         let addr_a = AddrMangle::decode(&phs.socket_addr);
+        let udp_target = if socket.is_some() {
+            match self.udp_routes.lock().await.take(try_into_v4(addr_a), try_into_v4(addr), &phs.id) {
+                Some(pending) => Some(pending.udp),
+                None => return Ok(()),
+            }
+        } else { None };
         log::debug!(
             "{} punch hole response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -856,6 +886,8 @@ impl RendezvousServer {
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
             webrtc_sdp_answer: phs.webrtc_sdp_answer,
+            socket_addr_v6: udp_punch::ipv6(phs.socket_addr_v6),
+            is_udp: socket.is_some(),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -863,7 +895,8 @@ impl RendezvousServer {
         }
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            if let Some(target) = udp_target { socket.send(&msg_out, target).await?; }
+            self.send_to_tcp(msg_out, addr_a).await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -879,6 +912,12 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         // relay local addrs of B to A
         let addr_a = AddrMangle::decode(&la.socket_addr);
+        let udp_target = if socket.is_some() {
+            match self.udp_routes.lock().await.take(try_into_v4(addr_a), try_into_v4(addr), &la.id) {
+                Some(pending) => Some(pending.udp),
+                None => return Ok(()),
+            }
+        } else { None };
         log::debug!(
             "{} local addrs response to {:?} from {:?}",
             if socket.is_none() { "TCP" } else { "UDP" },
@@ -890,12 +929,15 @@ impl RendezvousServer {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
+            socket_addr_v6: udp_punch::ipv6(la.socket_addr_v6),
+            is_udp: socket.is_some(),
             ..Default::default()
         };
         p.set_is_local(true);
         msg_out.set_punch_hole_response(p);
         if let Some(socket) = socket {
-            socket.send(&msg_out, addr_a).await?;
+            if let Some(target) = udp_target { socket.send(&msg_out, target).await?; }
+            self.send_to_tcp(msg_out, addr_a).await;
         } else {
             self.send_to_tcp(msg_out, addr_a).await;
         }
@@ -981,6 +1023,7 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    socket_addr_v6: udp_punch::ipv6(ph.socket_addr_v6),
                     ..Default::default()
                 });
             } else {
@@ -996,6 +1039,8 @@ impl RendezvousServer {
                     relay_server,
                     force_relay: ph.force_relay,
                     webrtc_sdp_offer: ph.webrtc_sdp_offer,
+                    udp_port: if udp_punch::enabled("ENABLE_UDP_PUNCH") && (1..=65535).contains(&ph.udp_port) { ph.udp_port } else { 0 },
+                    socket_addr_v6: udp_punch::ipv6(ph.socket_addr_v6),
                     ..Default::default()
                 });
             }
@@ -1065,9 +1110,17 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
+        let udp_port = ph.udp_port;
+        let id = ph.id.clone();
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(peer_addr) = to_addr {
             self.punch_targets.lock().await.insert(try_into_v4(addr), try_into_v4(peer_addr));
+            if !ws && udp_punch::enabled("ENABLE_UDP_PUNCH") && (1..=65535).contains(&udp_port) {
+                self.udp_routes.lock().await.insert(try_into_v4(addr), Pending {
+                    peer: try_into_v4(peer_addr), id, udp: SocketAddr::new(try_into_v4(addr).ip(), udp_port as u16),
+                    created: Instant::now(), retries: 0,
+                });
+            }
         }
         if let Some(addr) = to_addr {
             if self.connections.lock().await.contains_key(&try_into_v4(addr)) {
@@ -1088,14 +1141,11 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, false).await?;
-        self.tx.send(Data::Msg(
-            msg.into(),
-            match to_addr {
-                Some(addr) => addr,
-                None => addr,
-            },
-        ))?;
+        let route = self.udp_routes.lock().await.retry(try_into_v4(addr), &ph.id);
+        if let Some(route) = route {
+            let (msg, to_addr) = self.handle_punch_hole_request(route, ph, key, false).await?;
+            if let Some(target) = to_addr { self.tx.send(Data::Msg(msg.into(), target))?; }
+        }
         Ok(())
     }
 
