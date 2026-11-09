@@ -77,7 +77,7 @@ impl Sink {
 }
 type SharedSink = Arc<Mutex<Sink>>;
 #[derive(Clone)]
-struct RegisteredSession { sink: SharedSink, id: String, secure: bool }
+struct RegisteredSession { sink: SharedSink, id: String, secure: bool, transport: &'static str }
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 type Sender = mpsc::UnboundedSender<Data>;
@@ -171,6 +171,7 @@ pub struct RendezvousServer {
     punch_targets: Arc<Mutex<HashMap<SocketAddr, SocketAddr>>>,
     udp_routes: Arc<Mutex<Routes>>,
     udp_nat_budget: Arc<Mutex<(Instant, u16)>>,
+    duplicate_ids: Arc<Mutex<crate::duplicate_id::Tracker>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -230,6 +231,7 @@ impl RendezvousServer {
             punch_targets: Default::default(),
             udp_routes: Default::default(),
             udp_nat_budget: Arc::new(Mutex::new((Instant::now(), 0))),
+            duplicate_ids: Default::default(),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -654,7 +656,7 @@ impl RendezvousServer {
                     if result != register_pk_response::Result::OK { return false; }
                     if let Some(sink) = sink.take() {
                         self.connections.lock().await.insert(try_into_v4(addr), RegisteredSession {
-                            sink: Arc::new(Mutex::new(sink)), id, secure: secured,
+                            sink: Arc::new(Mutex::new(sink)), id, secure: secured, transport: if ws { "ws" } else { "tcp" },
                         });
                     }
                     return true;
@@ -787,6 +789,7 @@ impl RendezvousServer {
     async fn refresh_registration(&self, addr: SocketAddr) {
         let session = self.connections.lock().await.get(&try_into_v4(addr)).cloned();
         if let Some(session) = session {
+            self.observe_id(&session.id, addr, session.transport).await;
             if let Some(peer) = self.pm.get_in_memory(&session.id).await {
                 let mut peer = peer.write().await;
                 if try_into_v4(peer.socket_addr) == try_into_v4(addr) {
@@ -859,6 +862,7 @@ impl RendezvousServer {
         } else {
             (true, None)
         };
+        if !request_pk { self.observe_id(&id, socket_addr, "udp").await; }
         if let Some(old) = ip_change {
             log::info!("IP change of {} from {} to {}", id, old, socket_addr);
         }
@@ -868,6 +872,12 @@ impl RendezvousServer {
             ..Default::default()
         });
         socket.send(&msg_out, socket_addr).await
+    }
+
+    async fn observe_id(&self, id: &str, addr: SocketAddr, transport: &'static str) {
+        if self.duplicate_ids.lock().await.observe(id, addr, Instant::now()) {
+            security_log::record("hbbs", Event::DuplicateId, addr, transport, "multiple_live_sources", Some(id));
+        }
     }
 
     #[inline]
