@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::signaling::ServerHandshake;
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -16,7 +17,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::FramedStream,
+    tcp::{Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -51,8 +52,26 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
+}
+impl Sink {
+    async fn send(&mut self, message: &RendezvousMessage) -> ResultType<()> {
+        let bytes = message.write_to_bytes()?;
+        match self {
+            Sink::TcpStream(sink, cipher) => {
+                let bytes = match cipher.as_mut() {
+                    Some(cipher) => cipher.enc(&bytes),
+                    None => bytes,
+                };
+                timeout(10_000, sink.send(Bytes::from(bytes))).await??;
+            }
+            Sink::Ws(sink) => {
+                timeout(10_000, sink.send(tungstenite::Message::Binary(bytes.into()))).await??;
+            }
+        }
+        Ok(())
+    }
 }
 type Sender = mpsc::UnboundedSender<Data>;
 type Receiver = mpsc::UnboundedReceiver<Data>;
@@ -916,16 +935,7 @@ impl RendezvousServer {
     #[inline]
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
         if let Some(sink) = sink.as_mut() {
-            if let Ok(bytes) = msg.write_to_bytes() {
-                match sink {
-                    Sink::TcpStream(s) => {
-                        allow_err!(s.send(Bytes::from(bytes)).await);
-                    }
-                    Sink::Ws(ws) => {
-                        allow_err!(ws.send(tungstenite::Message::Binary(Bytes::from(bytes))).await);
-                    }
-                }
-            }
+            allow_err!(sink.send(&msg).await);
         }
     }
 
@@ -1299,8 +1309,34 @@ impl RendezvousServer {
             let mut framed = Framed::new(stream, BytesCodec::new());
             framed.codec_mut().set_max_packet_length(*MAX_MESSAGE);
             let (a, mut b) = framed.split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            let mut handshake = None;
+            let mut decrypt: Option<Encrypt> = None;
+            if !key.is_empty() {
+                if let Some(signing_key) = self.inner.sk.as_ref() {
+                    let (state, advertisement) = ServerHandshake::start(signing_key)?;
+                    let mut message = RendezvousMessage::new();
+                    message.set_key_exchange(advertisement);
+                    if let Some(sink) = sink.as_mut() { sink.send(&message).await?; }
+                    handshake = Some(state);
+                }
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(cipher) = decrypt.as_mut() { cipher.dec(&mut bytes)?; }
+                if let Ok(message) = RendezvousMessage::parse_from_bytes(&bytes) {
+                    if let Some(rendezvous_message::Union::KeyExchange(reply)) = message.union {
+                        let state = handshake.take().ok_or_else(|| {
+                            hbb_common::anyhow::anyhow!("Unexpected key exchange")
+                        })?;
+                        let cipher = state.finish(&reply)?;
+                        decrypt = Some(cipher.clone());
+                        if let Some(Sink::TcpStream(_, encrypt)) = sink.as_mut() {
+                            *encrypt = Some(cipher);
+                        }
+                        continue;
+                    }
+                }
+                handshake = None;
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
