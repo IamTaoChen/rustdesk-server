@@ -1,0 +1,17 @@
+**
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!db_v2.sqlite3
+!src/
+!src/**
+!libs/
+!libs/hbb_common/
+!libs/hbb_common/**
+!docker/
+!docker/**
+**/.git
+**/target
+docker/rootfs/usr/bin/hbbs
+docker/rootfs/usr/bin/hbbr
+docker/rootfs/usr/bin/rustdesk-utils

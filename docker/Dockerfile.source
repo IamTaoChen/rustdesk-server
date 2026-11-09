@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1
+ARG RUST_VERSION=1.92
+ARG API_IMAGE=lejianwen/rustdesk-api:latest
+
+FROM rust:${RUST_VERSION} AS builder
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libx11-dev libxtst-dev libxrandr-dev libxi-dev libxfixes-dev libsodium-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+COPY Cargo.toml Cargo.lock build.rs db_v2.sqlite3 ./
+COPY src/ src/
+COPY libs/hbb_common/ libs/hbb_common/
+ENV DATABASE_URL=sqlite:///app/db_v2.sqlite3
+ARG CARGO_BUILD_JOBS=4
+ARG TARGETARCH
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,id=rustdesk-target-${TARGETARCH},target=/app/target \
+    cargo build --release --locked -p hbbs --jobs ${CARGO_BUILD_JOBS} && \
+    mkdir /out && cp target/release/hbbs target/release/hbbr target/release/rustdesk-utils /out/
+
+FROM debian:trixie-slim AS s6
+ARG S6_OVERLAY_VERSION=3.2.3.2
+ARG S6_ARCH=x86_64
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir /overlay && \
+    curl -fsSL https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-noarch.tar.xz -o /tmp/noarch.tar.xz && \
+    curl -fsSL https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}/s6-overlay-${S6_ARCH}.tar.xz -o /tmp/arch.tar.xz && \
+    tar -C /overlay -Jxpf /tmp/noarch.tar.xz && tar -C /overlay -Jxpf /tmp/arch.tar.xz
+
+FROM debian:trixie-slim AS server-runtime
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates tzdata libssl3t64 libgcc-s1 zlib1g libzstd1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=s6 /overlay/ /
+COPY --from=builder /out/hbbs /usr/bin/hbbs
+COPY --from=builder /out/hbbr /usr/bin/hbbr
+COPY --from=builder /out/rustdesk-utils /usr/bin/rustdesk-utils
+COPY docker/rootfs/ /
+ENV RELAY=relay.example.com ENCRYPTED_ONLY=0 RMEMS=0
+EXPOSE 21115 21116 21116/udp 21117 21118 21119
+HEALTHCHECK --interval=10s --timeout=5s CMD /usr/bin/healthcheck.sh
+WORKDIR /data
+VOLUME /data
+ENTRYPOINT ["/init"]
+
+FROM ${API_IMAGE} AS api
+FROM server-runtime AS with-api
+COPY --from=api /app/ /app/
+COPY docker/api-rootfs/ /
+ENV API_PROXY_UPSTREAM=http://127.0.0.1:21114
+EXPOSE 21114
+VOLUME /app/data
+
+# Source builds default to the server. Select --target with-api to bundle an API.
+FROM server-runtime AS runtime

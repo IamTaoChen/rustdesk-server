@@ -1,4 +1,8 @@
 #!/bin/sh
 
-/package/admin/s6/command/s6-svstat /run/s6-rc/servicedirs/hbbr || exit 1
-/package/admin/s6/command/s6-svstat /run/s6-rc/servicedirs/hbbs || exit 1
+for service in hbbr hbbs; do
+  [ "$(/command/s6-svstat -o up /run/s6-rc/servicedirs/$service)" = true ] || exit 1
+done
+if [ -f /app/apimain ]; then
+  [ "$(/command/s6-svstat -o up /run/s6-rc/servicedirs/api)" = true ] || exit 1
+fi

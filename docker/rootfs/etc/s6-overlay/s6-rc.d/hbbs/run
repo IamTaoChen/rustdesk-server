@@ -1,6 +1,6 @@
 #!/command/with-contenv sh
-sleep 2
-cd /data
-PARAMS=
-[ "${ENCRYPTED_ONLY}" = "1" ] && PARAMS="-k _"
-/usr/bin/hbbs -r $RELAY $PARAMS
+cd /data || exit 1
+case "${RMEMS:-0}" in *[!0-9]*|'') echo "RMEMS must be a nonnegative integer" >&2; exit 1;; esac
+set -- -r "${RELAY:-relay.example.com}" -M "${RMEMS:-0}"
+[ "${ENCRYPTED_ONLY}" = "1" ] && set -- "$@" -k _
+exec /usr/bin/hbbs "$@"
