@@ -172,6 +172,7 @@ pub struct RendezvousServer {
     udp_routes: Arc<Mutex<Routes>>,
     udp_nat_budget: Arc<Mutex<(Instant, u16)>>,
     duplicate_ids: Arc<Mutex<crate::duplicate_id::Tracker>>,
+    api_proxy: Option<Arc<crate::api_proxy::ApiProxy>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -232,6 +233,7 @@ impl RendezvousServer {
             udp_routes: Default::default(),
             udp_nat_budget: Arc::new(Mutex::new((Instant::now(), 0))),
             duplicate_ids: Default::default(),
+            api_proxy: crate::api_proxy::ApiProxy::from_env()?.map(Arc::new),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -548,6 +550,21 @@ impl RendezvousServer {
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                Some(rendezvous_message::Union::HttpProxyRequest(request)) => {
+                    let response = if ws || !secured {
+                        crate::api_proxy::error(403, "encrypted_tcp_required")
+                    } else if let Some(proxy) = self.api_proxy.as_ref() {
+                        proxy.execute(request, addr).await
+                    } else { crate::api_proxy::error(503, "proxy_disabled") };
+                    if !response.error.is_empty() {
+                        let outcome = match response.status { 504 => "timeout", 502 => "upstream_failure", 503 => "unavailable", _ => "invalid_request" };
+                        security_log::record("hbbs", if response.status >= 500 { Event::ProxyFailed } else { Event::ProxyRejected }, addr, if ws { "ws" } else { "tcp" }, outcome, None);
+                    }
+                    let mut message = RendezvousMessage::new();
+                    message.set_http_proxy_response(response);
+                    Self::send_to_sink(sink, message).await;
+                    return false;
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     if !ph.webrtc_sdp_offer.is_empty() && !secured { return false; }
                     // there maybe several attempt, so sink can be none
