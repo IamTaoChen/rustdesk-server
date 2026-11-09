@@ -21,6 +21,44 @@ The default API image is the upstream `lejianwen/rustdesk-api:latest`; override 
 
 The existing `docker/Dockerfile` and official CI retain the precompiled-binary packaging flow with `docker/` as the context. `Dockerfile.source` is a separate source-build entry point and requires the repository root as context.
 
+## Non-root runtime
+
+Both packaging entry points and both source targets run the entire process tree, including s6, as UID/GID `10001:10001`. The image prepares `/run` and `/data` for this identity; the API target also prepares `/app/data` and `/app/runtime`. Programs and configuration stay owned by root. Runtime initialization does not change file ownership or elevate privileges. Do not enable `privileged` or add capabilities.
+
+New Docker named volumes inherit the image directory ownership:
+
+```sh
+docker run -d --name rustdesk \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -e RELAY=relay.example.com \
+  -p 21115:21115 -p 21116:21116 -p 21116:21116/udp \
+  -p 21117:21117 -p 21118:21118 -p 21119:21119 \
+  -v rustdesk-data:/data rustdesk-server:local
+```
+
+For existing volumes or bind mounts, stop the old container, back up the data, and give UID/GID `10001:10001` ownership before starting the new image. For example, run `sudo chown -R 10001:10001 ./data` on the host for a `./data:/data` mount. Apply the same migration to mounted API data/log directories. Keep private keys at mode `0600`; do not make directories world-writable. Secrets must be readable by the runtime UID; configure their ownership at deployment. Imported keys are copied into `/data` with restrictive permissions and validated at startup. An unwritable `/data` or inaccessible existing key fails initialization instead of silently continuing. Changing `--user` to an arbitrary UID requires preparing all these writable locations for that identity yourself.
+
+For a read-only root filesystem, add:
+
+```sh
+--read-only \
+--tmpfs /run:uid=10001,gid=10001,mode=0755,exec \
+--tmpfs /tmp:mode=1777
+```
+
+The executable `/run` tmpfs is required by s6. Keep the data volumes writable. With the API target, also mount a writable log directory at `/app/runtime`, or add `--tmpfs /app/runtime:uid=10001,gid=10001,mode=0750` for disposable logs. API images with additional write destinations need corresponding writable mounts; custom configurations and resources must be readable by UID `10001`.
+
+Run the Docker smoke checks against your built images:
+
+```sh
+python3 docker/tests/nonroot.py rustdesk-server:local
+python3 docker/tests/nonroot.py rustdesk-server:local --read-only
+python3 docker/tests/nonroot.py rustdesk-server:with-api --api
+python3 docker/tests/nonroot.py rustdesk-server:with-api --api --read-only
+```
+
+These checks use disposable containers and anonymous data volumes, verify every process's credentials, zero capabilities and forbidden privilege escalation, then check key ownership, identity preservation across restart, service health, clean shutdown and the API version endpoint when enabled.
+
 ## Runtime options
 
 | Variable | Default | Purpose |

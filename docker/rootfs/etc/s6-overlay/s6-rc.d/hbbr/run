@@ -1,4 +1,5 @@
 #!/command/with-contenv sh
+umask 077
 cd /data || exit 1
 set --
 [ "${ENCRYPTED_ONLY}" = "1" ] && set -- "$@" -k _

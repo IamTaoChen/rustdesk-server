@@ -1,4 +1,5 @@
 #!/command/with-contenv sh
+umask 077
 cd /data || exit 1
 case "${RMEMS:-0}" in *[!0-9]*|'') echo "RMEMS must be a nonnegative integer" >&2; exit 1;; esac
 set -- -r "${RELAY:-relay.example.com}" -M "${RMEMS:-0}"

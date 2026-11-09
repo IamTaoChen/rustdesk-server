@@ -1,7 +1,11 @@
 #!/command/with-contenv sh
 
-if [ ! -d /data ] ; then
-  mkdir /data
+set -e
+umask 077
+
+if [ ! -d /data ] || [ ! -w /data ] ; then
+  echo "/data must be writable by the container user (default UID/GID 10001:10001)." >&2
+  exit 1
 fi
 
 # normal docker secrets
@@ -43,11 +47,10 @@ fi
 
 # here we have either no keys or both
 
-# if we have both keys, we fix permissions and ownership
+# if we have both keys, restrict permissions without changing ownership
 # and check for keypair validation
 if [ -f /data/id_ed25519.pub ] && [ -f /data/id_ed25519 ] ; then
   chmod 0600 /data/id_ed25519.pub /data/id_ed25519
-  chown root:root /data/id_ed25519.pub /data/id_ed25519
   /usr/bin/rustdesk-utils validatekeypair "$(cat /data/id_ed25519.pub)" "$(cat /data/id_ed25519)" || {
     echo "Key pair not valid"
     /run/s6/basedir/bin/halt

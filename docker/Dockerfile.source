@@ -38,20 +38,28 @@ COPY --from=builder /out/hbbs /usr/bin/hbbs
 COPY --from=builder /out/hbbr /usr/bin/hbbr
 COPY --from=builder /out/rustdesk-utils /usr/bin/rustdesk-utils
 COPY docker/rootfs/ /
-ENV RELAY=relay.example.com ENCRYPTED_ONLY=0 RMEMS=0
+RUN mkdir -p /run /data && chown 10001:10001 /run /data && chmod 0750 /data && \
+    chmod 0755 /command/s6-overlay-suexec
+ENV RELAY=relay.example.com ENCRYPTED_ONLY=0 RMEMS=0 \
+    HOME=/data S6_READ_ONLY_ROOT=1 S6_BEHAVIOUR_IF_STAGE2_FAILS=2
 EXPOSE 21115 21116 21116/udp 21117 21118 21119
 HEALTHCHECK --interval=10s --timeout=5s CMD /usr/bin/healthcheck.sh
 WORKDIR /data
 VOLUME /data
+USER 10001:10001
 ENTRYPOINT ["/init"]
 
 FROM ${API_IMAGE} AS api
 FROM server-runtime AS with-api
+USER root
 COPY --from=api /app/ /app/
 COPY docker/api-rootfs/ /
+RUN mkdir -p /app/data /app/runtime && \
+    chown -R 10001:10001 /app/data /app/runtime && chmod 0750 /app/data /app/runtime
 ENV API_PROXY_UPSTREAM=http://127.0.0.1:21114
 EXPOSE 21114
 VOLUME /app/data
+USER 10001:10001
 
 # Source builds default to the server. Select --target with-api to bundle an API.
 FROM server-runtime AS runtime
