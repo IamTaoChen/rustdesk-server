@@ -72,3 +72,27 @@ async fn plaintext_tcp_cannot_submit_sdp() {
     let result = timeout(Duration::from_secs(2), stream.next()).await.unwrap();
     assert!(result.is_none() || result.is_some_and(|result| result.is_err()));
 }
+
+#[tokio::test]
+async fn secure_answerer_does_not_send_ice_or_sdp_to_plaintext_controller() {
+    let server = support::Server::start(&[]);
+    let mut peer = server.secure(1).await;
+    let mut message = RendezvousMessage::new();
+    message.set_register_pk(RegisterPk { id: "123456789".into(), uuid: Bytes::from_static(&[1;16]), pk: Bytes::from_static(&[2;32]), ..Default::default() });
+    peer.send(&message).await.unwrap(); peer.next().await.unwrap().unwrap();
+    let mut controller = server.connect().await;
+    controller.next().await.unwrap().unwrap();
+    message.set_request_relay(RequestRelay { id: "123456789".into(), uuid: "plain-controller".into(), ..Default::default() });
+    controller.send(&message).await.unwrap();
+    let bytes = timeout(Duration::from_secs(2), peer.next()).await.unwrap().unwrap().unwrap();
+    let Some(rendezvous_message::Union::RequestRelay(request)) = RendezvousMessage::parse_from_bytes(&bytes).unwrap().union else { panic!("missing relay request"); };
+    message.set_ice_candidate(IceCandidate { socket_addr: request.socket_addr.clone(), session_key: "session".into(), candidate: "candidate:private".into(), ..Default::default() });
+    peer.send(&message).await.unwrap();
+    assert!(timeout(Duration::from_millis(150), controller.next()).await.is_err());
+    message.set_relay_response(RelayResponse { socket_addr: request.socket_addr, uuid: request.uuid, relay_server: "relay.example".into(), webrtc_sdp_answer: "private-answer".into(), ..Default::default() });
+    peer.send(&message).await.unwrap();
+    let bytes = timeout(Duration::from_secs(2), controller.next()).await.unwrap().unwrap().unwrap();
+    let Some(rendezvous_message::Union::RelayResponse(response)) = RendezvousMessage::parse_from_bytes(&bytes).unwrap().union else { panic!("missing fallback reply"); };
+    assert!(response.webrtc_sdp_answer.is_empty());
+    assert!(response.socket_addr_v6.is_empty());
+}

@@ -14,6 +14,8 @@ WebSocket application encryption is skipped by the official client. Terminate TL
 
 ICE replies must target a live punch route and come from the expected peer IP. ICE is not forwarded to arbitrary UDP addresses. Permissions and audit-context fields supplied by a controller are cleared: centralized permissions are outside this patch set, and clients must not assign themselves permissions.
 
+All punch/relay/local-address replies require an unexpired 30-second request route and the expected peer IP; supplied device IDs and relay session UUIDs must match that request. Official clients may answer from a new source port. SDP/ICE transport requirements apply to both sender and destination. UDP SDP is rejected; correlated ordinary UDP retries use a registered peer's TCP/WS transport when available. Persistent registrations remain usable after replies and follow-up queries, and session publication is serialized with device-ID changes.
+
 ## Experimental UDP and IPv6
 
 Both extensions are off by default. Set `ENABLE_UDP_PUNCH=Y` to enable observed-port NAT replies and UDP punch replies. An initial TCP punch request must establish the route and declare the controller's UDP port. Replies must match the expected peer IP and device ID, expire after 30 seconds, and consume the route. The table holds at most 4096 routes; correlated UDP retries are limited to two. Closing the TCP connection removes its pending route. Unsolicited UDP punch requests are ignored. NAT replies contain only the observed port and have a global budget of 200 packets per second.

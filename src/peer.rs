@@ -70,6 +70,11 @@ pub(crate) struct PeerMap {
 }
 
 impl PeerMap {
+    #[cfg(test)]
+    pub(crate) fn from_database(db: database::Database) -> Self {
+        Self { map: Default::default(), db, identity_lock: Default::default() }
+    }
+
     pub(crate) async fn new() -> ResultType<Self> {
         let db = get_arg_opt("DB_URL").unwrap_or_else(|| {
             let mut db = "db_v2.sqlite3".to_owned();

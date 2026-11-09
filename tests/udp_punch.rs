@@ -74,3 +74,32 @@ async fn udp_punch_stays_disabled_by_default() {
     socket.send_to(&message.write_to_bytes().unwrap(), format!("127.0.0.1:{}", server.port)).await.unwrap();
     assert!(timeout(Duration::from_millis(120), socket.recv(&mut [0; 2048])).await.is_err());
 }
+
+#[tokio::test]
+async fn udp_sdp_is_rejected_and_ordinary_retry_uses_secure_registration() {
+    let server = support::Server::start(&[("ENABLE_UDP_PUNCH", "Y")]);
+    let mut peer = server.secure(1).await;
+    let peer_udp = UdpSocket::bind(peer.local_addr()).await.unwrap();
+    let mut message = RendezvousMessage::new();
+    message.set_register_pk(RegisterPk { id: "987654321".into(), uuid: Bytes::from_static(&[3;16]), pk: Bytes::from_static(&[4;32]), ..Default::default() });
+    peer.send(&message).await.unwrap(); peer.next().await.unwrap().unwrap();
+    let mut controller = server.secure(1).await;
+    let controller_udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = format!("127.0.0.1:{}", server.port);
+    let mut request = PunchHoleRequest { id: "987654321".into(), licence_key: std::fs::read_to_string(server.directory.path().join("id_ed25519.pub")).unwrap(), udp_port: controller_udp.local_addr().unwrap().port() as i32, webrtc_sdp_offer: "secure-offer".into(), ..Default::default() };
+    message.set_punch_hole_request(request.clone()); controller.send(&message).await.unwrap();
+    let bytes = timeout(Duration::from_secs(2), peer.next()).await.unwrap().unwrap().unwrap();
+    let Some(rendezvous_message::Union::PunchHole(punch)) = RendezvousMessage::parse_from_bytes(&bytes).unwrap().union else { panic!("missing encrypted offer"); };
+    controller_udp.send_to(&message.write_to_bytes().unwrap(), &destination).await.unwrap();
+    assert!(timeout(Duration::from_millis(120), peer_udp.recv(&mut [0;2048])).await.is_err());
+    assert!(timeout(Duration::from_millis(120), peer.next()).await.is_err());
+    request.webrtc_sdp_offer.clear(); message.set_punch_hole_request(request);
+    controller_udp.send_to(&message.write_to_bytes().unwrap(), &destination).await.unwrap();
+    let bytes = timeout(Duration::from_secs(2), peer.next()).await.unwrap().unwrap().unwrap();
+    assert!(matches!(RendezvousMessage::parse_from_bytes(&bytes).unwrap().union, Some(rendezvous_message::Union::FetchLocalAddr(_))));
+    assert!(timeout(Duration::from_millis(120), peer_udp.recv(&mut [0;2048])).await.is_err());
+    message.set_punch_hole_sent(PunchHoleSent { id: "987654321".into(), socket_addr: punch.socket_addr, webrtc_sdp_answer: "plaintext-answer".into(), ..Default::default() });
+    peer_udp.send_to(&message.write_to_bytes().unwrap(), &destination).await.unwrap();
+    assert!(timeout(Duration::from_millis(120), controller_udp.recv(&mut [0;2048])).await.is_err());
+    assert!(timeout(Duration::from_millis(120), controller.next()).await.is_err());
+}
