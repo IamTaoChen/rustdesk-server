@@ -779,7 +779,7 @@ fn get_server_sk(key: &str) -> ResultType<String> {
     }
 
     if !key.is_empty() {
-        log::info!("Key: {}", key);
+        log::info!("Server key configured");
     }
 
     Ok(key)

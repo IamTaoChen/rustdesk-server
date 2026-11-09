@@ -1737,7 +1737,7 @@ impl RendezvousServer {
         }
 
         if !key.is_empty() {
-            log::info!("Key: {}", key);
+            log::info!("Server key configured");
         }
         Ok((key, out_sk))
     }

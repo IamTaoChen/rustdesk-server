@@ -385,7 +385,6 @@ pub fn gen_sk(wait: u64) -> ResultType<(String, Option<sign::SecretKey>)> {
         .context("Failed to create private key file")?;
     write_public_key(&pub_file, &pk, true)?;
     log::info!("Private/public key written to {}/{}", sk_file, pub_file);
-    log::debug!("Public key: {}", pk);
     Ok((pk, Some(sk)))
 }
 
