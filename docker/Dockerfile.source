@@ -52,11 +52,14 @@ ENTRYPOINT ["/init"]
 FROM ${API_IMAGE} AS api
 FROM server-runtime AS with-api
 USER root
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=api /app/ /app/
 COPY docker/api-rootfs/ /
 RUN mkdir -p /app/data /app/runtime && \
     chown -R 10001:10001 /app/data /app/runtime && chmod 0750 /app/data /app/runtime
-ENV API_PROXY_UPSTREAM=http://127.0.0.1:21114
+ENV API_PROXY_UPSTREAM=http://127.0.0.1:21114 \
+    RUSTDESK_API_GIN_TRUST_PROXY=127.0.0.1,::1
 EXPOSE 21114
 VOLUME /app/data
 USER 10001:10001

@@ -19,6 +19,17 @@ mod tests {
     fn request() -> HttpProxyRequest { HttpProxyRequest { method: "GET".into(), path: "/api/version".into(), ..Default::default() } }
 
     #[tokio::test]
+    async fn unavailable_upstream_is_retryable_without_replaying_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let proxy = ApiProxy::new(&format!("http://{address}"), Duration::from_secs(1)).unwrap();
+        let response = proxy.execute(request(), "127.0.0.1:1234".parse().unwrap()).await;
+        assert_eq!(response.status, 503);
+        assert_eq!(response.error, "upstream_unavailable");
+    }
+
+    #[tokio::test]
     async fn upstream_redirects_are_not_followed_and_oversized_bodies_are_bounded() {
         for (reply, expected) in [
             (b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/admin\r\nContent-Length: 0\r\n\r\n".as_slice(), 302),
@@ -125,7 +136,9 @@ impl ApiProxy {
         headers.insert("x-real-ip", value);
         let mut response = match self.client.request(method, url).headers(headers).body(request.body.to_vec()).send().await {
             Ok(response) => response,
-            Err(err) => return if err.is_timeout() { error(504, "upstream_timeout") } else { error(502, "upstream_unavailable") },
+            Err(err) => return if err.is_timeout() { error(504, "upstream_timeout") }
+                else if err.is_connect() { error(503, "upstream_unavailable") }
+                else { error(502, "upstream_unavailable") },
         };
         if response.content_length().map(|len| len > RESPONSE_LIMIT as u64).unwrap_or(false) { return error(502, "response_too_large"); }
         let status = response.status().as_u16() as i32;

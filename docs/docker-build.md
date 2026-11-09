@@ -72,3 +72,11 @@ These checks use disposable containers and anonymous data volumes, verify every 
 | `SECURITY_LOG_FILE` | unset | Optional separate append-only JSON Lines file; otherwise stderr |
 
 Key negotiation, persistent registration and WebRTC forwarding need no feature switch. WebRTC's transport requirements are in `signaling.md`. Security collection/parser configuration is in `security-logging.md`; create the log directory before setting a file destination. The API proxy's limits and trust setup are in `api-proxy.md`. Relay selection retains upstream round robin; weighted selection is deferred.
+
+## API readiness and proxy trust
+
+The combined image checks the API's HTTP readiness in addition to s6 process state. Updated API images expose `/api/health`, including a database check. A 404 from older images falls back to `/api/version`; other failures remain unhealthy. Set `API_HEALTHCHECK_BASE` if the API listens on a different local origin, or `API_HEALTHCHECK_URL` for a custom health endpoint (an explicit URL has no legacy fallback). These health settings do not change `API_PROXY_UPSTREAM`; configure both when changing the API listener.
+
+The combined image sets `RUSTDESK_API_GIN_TRUST_PROXY=127.0.0.1,::1` so the API accepts hbbs's sanitized source IP headers. Updated standalone API deployments default to ignoring forwarded headers. If another reverse proxy reaches the API, explicitly include its actual IP/CIDR in the trust list and ensure it overwrites incoming forwarding headers.
+
+An API process whose HTTP/database check fails is unhealthy even while supervised by s6. hbbs reports connection failure to the API as HTTP 503 and does not retry or replay the request automatically. Ordinary server-only images do not install or require the API HTTP probe.

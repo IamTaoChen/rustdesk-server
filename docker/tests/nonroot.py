@@ -85,6 +85,17 @@ test "$(stat -c %u:%g /data/id_ed25519)" = 10001:10001
                     if time.monotonic() >= deadline:
                         raise
                     time.sleep(1)
+        if api:
+            # A live supervisor process is insufficient when HTTP cannot respond.
+            service_path = "/run/s6-rc/servicedirs/api"
+            docker("exec", name, "/command/s6-svc", "-p", service_path)
+            try:
+                assert docker("exec", name, "/command/s6-svstat", "-o", "up", service_path).stdout.strip() == "true", "API process exited"
+                if docker("exec", name, "/usr/bin/healthcheck.sh", check=False).returncode == 0:
+                    raise AssertionError("health check missed unresponsive API")
+            finally:
+                docker("exec", name, "/command/s6-svc", "-c", service_path)
+            healthy(name)
         service = "api" if api else "hbbs"
         docker("exec", name, "/command/s6-svc", "-d", f"/run/s6-rc/servicedirs/{service}")
         for _ in range(50):
